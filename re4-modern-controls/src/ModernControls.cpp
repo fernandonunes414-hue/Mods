@@ -29,6 +29,83 @@ bool controllerEnabled = true;
 float controllerDeadZone = 0.25f;
 bool controllerInvertY{};
 bool controllerRightStick{};
+bool controllerAimRightStick = true;
+bool controllerAimDirectionBits = true;
+
+// The game aims with the left stick on a gamepad. While the mod moves the
+// character with that stick, the native aim routine is fed the RIGHT stick
+// instead, then every value is restored. Scales are learned from the game's
+// own left-stick values, so no unknown range is assumed.
+struct StickScale {
+    float ratio{};
+    bool known{};
+    void learn(float axis, int value) {
+        if (std::fabs(axis) < 0.5f || value == 0) return;
+        ratio = float(value) / axis;
+        known = std::isfinite(ratio);
+    }
+    int map(float axis) const { return known ? int(std::lround(axis * ratio)) : 0; }
+};
+StickScale joyX, joyY, pcX, pcY;
+
+class ScopedPadAim {
+    JOY* joy_;
+    std::uint64_t* on_;
+    std::uint64_t* trigger_;
+    int saved_[4]{};
+    float savedF_[2]{};
+    std::uint64_t savedOn_{}, savedTrigger_{};
+public:
+    ScopedPadAim(JOY* joy, std::uint64_t* on, std::uint64_t* trigger)
+        : joy_(joy), on_(on), trigger_(trigger) {
+        if (!fAnalogLX || !fAnalogLY || !fAnalogRX || !fAnalogRY) return;
+        const float rx = *fAnalogRX, ry = *fAnalogRY;
+        savedF_[0] = *fAnalogLX; savedF_[1] = *fAnalogLY;
+        if (joy_) {
+            saved_[0] = joy_->leftStick_X_0; saved_[1] = joy_->leftStick_Y_4;
+            saved_[2] = joy_->pc_leftStick_X_118; saved_[3] = joy_->pc_leftStick_Y_11C;
+            joyX.learn(savedF_[0], saved_[0]); joyY.learn(savedF_[1], saved_[1]);
+            pcX.learn(savedF_[0], saved_[2]); pcY.learn(savedF_[1], saved_[3]);
+            joy_->leftStick_X_0 = joyX.map(rx); joy_->leftStick_Y_4 = joyY.map(ry);
+            joy_->pc_leftStick_X_118 = pcX.map(rx); joy_->pc_leftStick_Y_11C = pcY.map(ry);
+        }
+        *fAnalogLX = rx; *fAnalogLY = ry;
+        if (on_ && trigger_) {
+            constexpr std::uint64_t dirs = 0xF; // FORWARD, BACK, RIGHT, LEFT
+            savedOn_ = *on_; savedTrigger_ = *trigger_;
+            *on_ &= ~dirs; *trigger_ &= ~dirs;
+            if (controllerAimDirectionBits) {
+                const float fy = controllerInvertY ? -ry : ry;
+                if (fy > 0.5f) *on_ |= std::uint64_t(KEY_BTN::KEY_FORWARD);
+                if (fy < -0.5f) *on_ |= std::uint64_t(KEY_BTN::KEY_BACK);
+                if (rx > 0.5f) *on_ |= std::uint64_t(KEY_BTN::KEY_RIGHT);
+                if (rx < -0.5f) *on_ |= std::uint64_t(KEY_BTN::KEY_LEFT);
+            }
+        }
+        static int logged{};
+        if (logged++ < 3)
+            spd::log()->info("ModernControls -> pad aim swap: fLX={} fLY={} joy=({},{}) pc=({},{}) fRX={} fRY={}",
+                savedF_[0], savedF_[1], saved_[0], saved_[1], saved_[2], saved_[3], rx, ry);
+        active_ = true;
+    }
+    ~ScopedPadAim() {
+        if (!active_) return;
+        *fAnalogLX = savedF_[0]; *fAnalogLY = savedF_[1];
+        if (joy_) {
+            joy_->leftStick_X_0 = saved_[0]; joy_->leftStick_Y_4 = saved_[1];
+            joy_->pc_leftStick_X_118 = saved_[2]; joy_->pc_leftStick_Y_11C = saved_[3];
+        }
+        if (on_ && trigger_) {
+            constexpr std::uint64_t dirs = 0xF;
+            *on_ = (*on_ & ~dirs) | (savedOn_ & dirs);
+            *trigger_ = (*trigger_ & ~dirs) | (savedTrigger_ & dirs);
+        }
+    }
+    ScopedPadAim(const ScopedPadAim&) = delete;
+    ScopedPadAim& operator=(const ScopedPadAim&) = delete;
+private:
+    bool active_{};
+};
 
 bool executableAddress(const void* address) {
     MEMORY_BASIC_INFORMATION info{};
@@ -174,6 +251,9 @@ template<unsigned entry> void __cdecl dispatch(cPlayer* player) {
     const auto keys = readKeys(c); // Release the input lock before calling native code.
     const auto moveDirection = readDirection(c, keys);
     const auto decision = re4mc::decide(c, moveDirection, keys.run);
+    // Gamepad aim: the left stick moves, so the game aims with the right stick.
+    const bool padAim = c.controller && controllerAimRightStick && !controllerRightStick &&
+                        re4mc::aimState(c);
     static std::array<unsigned, 5> observations{};
     const auto action = unsigned(decision.action);
     const bool report = observations[action]++ < 2;
@@ -181,7 +261,12 @@ template<unsigned entry> void __cdecl dispatch(cPlayer* player) {
         if (report) re4mc::diagnostics::trace("before_native", entry, action, player,
             reinterpret_cast<const void*>(originals[next]));
         re4mc::diagnostics::mark(2, entry);
-        originals[next](player);
+        if (padAim && next == entry) {
+            ScopedPadAim swap(JoyPtr(), keyOn, keyTrigger);
+            originals[next](player);
+        } else {
+            originals[next](player);
+        }
         re4mc::diagnostics::mark(3, entry);
         if (report) re4mc::diagnostics::trace("after_native", entry, action, player,
             reinterpret_cast<const void*>(originals[next]));
@@ -254,6 +339,8 @@ void readConfig() {
     controllerEnabled = GetPrivateProfileIntW(L"CONTROLLER", L"Enabled", 1, path.c_str()) != 0;
     controllerInvertY = GetPrivateProfileIntW(L"CONTROLLER", L"InvertY", 0, path.c_str()) != 0;
     controllerRightStick = GetPrivateProfileIntW(L"CONTROLLER", L"MoveStick", 0, path.c_str()) == 1;
+    controllerAimRightStick = GetPrivateProfileIntW(L"CONTROLLER", L"AimRightStick", 1, path.c_str()) != 0;
+    controllerAimDirectionBits = GetPrivateProfileIntW(L"CONTROLLER", L"AimDirectionBits", 1, path.c_str()) != 0;
     GetPrivateProfileStringW(L"CONTROLLER", L"DeadZone", L"0.25", number, 80, path.c_str());
     const auto dead = std::wcstof(number, &end);
     if (end != number && *end == 0 && std::isfinite(dead)) controllerDeadZone = std::clamp(dead, 0.0f, 0.9f);
@@ -354,6 +441,6 @@ void re4t::init::ModernControls() {
     re4t::cfg->bResetCameraAfterUsingWeapons = false;
     re4t::cfg->bResetCameraAfterUsingKnife = false;
     re4t::cfg->bUseSprintToggle = false;
-    spd::log()->info("ModernControls -> EXPERIMENTAL 0.1.4 + CONTROLE, KB/M enabled; gamepad aim-walk={} (stick={}, deadzone={}, invertY={}); Leon/Ashley/Ada/HUNK/Krauser/Wesker; independent camera reference; diagnostics={}; native Walk/Run prologues preserved; game validation pending",
-        controllerEnabled, controllerRightStick ? "right" : "left", controllerDeadZone, controllerInvertY, diagnosticEnabled);
+    spd::log()->info("ModernControls -> EXPERIMENTAL 0.1.4 + CONTROLE, KB/M enabled; gamepad aim-walk={} (stick={}, deadzone={}, invertY={}, aimRight={}, aimBits={}); Leon/Ashley/Ada/HUNK/Krauser/Wesker; independent camera reference; diagnostics={}; native Walk/Run prologues preserved; game validation pending",
+        controllerEnabled, controllerRightStick ? "right" : "left", controllerDeadZone, controllerInvertY, controllerAimRightStick, controllerAimDirectionBits, diagnosticEnabled);
 }
