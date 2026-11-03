@@ -61,17 +61,23 @@ inline Direction analogDirection(float x, float y, float deadZone) {
     const float scale = std::min((length - deadZone) / (1.0f - deadZone), 1.0f);
     return {x / length * scale, y / length * scale, true};
 }
+inline bool controlAllowed(const Context& c) {
+    return c.enabled && c.focused && (c.keyboardMouse || c.controller) && !c.blocked &&
+        c.mainLoop && c.alive && c.playerObject && c.collisionEnabled &&
+        supportedCharacter(c.character) && !c.specialAction && !c.scoped &&
+        c.routine0 == 0 && c.routine1 <= 6;
+}
+// Armed character in the normal aim/fire state (not reload, draw or throw).
+inline bool aimState(const Context& c) {
+    // Ashley has no weapon routine. Draw/holster/reload, scripted actions
+    // and item throws keep their native positioning and animation timing.
+    return controlAllowed(c) && c.routine1 == 6 && c.character != Character::Ashley &&
+        c.aiming && (c.routine2 == 1 || (c.routine2 == 2 && !thrownWeapon(c.weapon)));
+}
 inline Decision decide(const Context& c, Direction d, bool run) {
-    if (!c.enabled || !c.focused || (!c.keyboardMouse && !c.controller) || c.blocked ||
-        !c.mainLoop || !c.alive || !c.playerObject || !c.collisionEnabled ||
-        !supportedCharacter(c.character) || c.specialAction || c.scoped ||
-        c.routine0 != 0 || c.routine1 > 6) return {};
+    if (!controlAllowed(c)) return {};
     if (c.routine1 == 6) {
-        // Ashley has no weapon routine. Draw/holster/reload, scripted actions
-        // and item throws keep their native positioning and animation timing.
-        const bool aimState = c.routine2 == 1 || (c.routine2 == 2 && !thrownWeapon(c.weapon));
-        if (c.character != Character::Ashley && c.aiming && aimState && d.moving)
-            return {Action::AimMove, d};
+        if (aimState(c) && d.moving) return {Action::AimMove, d};
         return {};
     }
     // Gamepad outside the aim: the game's own movement and camera.
