@@ -32,6 +32,8 @@ struct Context {
     bool mainLoop{true}, alive{true}, playerObject{true};
     bool collisionEnabled{true}, scoped{}, aiming{};
     bool specialAction{};
+    // Gamepad: only walking while aiming is handled; the rest stays native.
+    bool controller{};
     Character character{Character::Leon};
     std::uint8_t routine0{}, routine1{}, routine2{}, weapon{2};
 };
@@ -49,12 +51,21 @@ inline Direction direction(Keys keys) {
     if (length == 0) return {};
     return {x / length, z / length, true};
 }
-inline Decision decide(const Context& c, Keys keys) {
-    if (!c.enabled || !c.focused || !c.keyboardMouse || c.blocked ||
+// Analog stick (-1..1 per axis) with a radial dead zone. Partial tilt gives a
+// proportionally slower step; full tilt is never faster than a keyboard key.
+inline Direction analogDirection(float x, float y, float deadZone) {
+    if (!std::isfinite(x) || !std::isfinite(y)) return {};
+    deadZone = std::clamp(std::isfinite(deadZone) ? deadZone : 0.25f, 0.0f, 0.9f);
+    const float length = std::hypot(x, y);
+    if (length <= deadZone || length == 0) return {};
+    const float scale = std::min((length - deadZone) / (1.0f - deadZone), 1.0f);
+    return {x / length * scale, y / length * scale, true};
+}
+inline Decision decide(const Context& c, Direction d, bool run) {
+    if (!c.enabled || !c.focused || (!c.keyboardMouse && !c.controller) || c.blocked ||
         !c.mainLoop || !c.alive || !c.playerObject || !c.collisionEnabled ||
         !supportedCharacter(c.character) || c.specialAction || c.scoped ||
         c.routine0 != 0 || c.routine1 > 6) return {};
-    const auto d = direction(keys);
     if (c.routine1 == 6) {
         // Ashley has no weapon routine. Draw/holster/reload, scripted actions
         // and item throws keep their native positioning and animation timing.
@@ -63,10 +74,15 @@ inline Decision decide(const Context& c, Keys keys) {
             return {Action::AimMove, d};
         return {};
     }
+    // Gamepad outside the aim: the game's own movement and camera.
+    if (!c.keyboardMouse) return {};
     // Let the original game enter the aiming state and handle its animations.
     if (c.aiming) return {};
     if (!d.moving) return {Action::Idle, d};
-    return {keys.run ? Action::Run : Action::Walk, d};
+    return {run ? Action::Run : Action::Walk, d};
+}
+inline Decision decide(const Context& c, Keys keys) {
+    return decide(c, direction(keys), keys.run);
 }
 // RE4's mouse orbit is relative to the player's yaw; positive yaw turns left.
 inline float headingOffset(Direction d) {
