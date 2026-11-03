@@ -24,6 +24,11 @@ bool diagnosticEnabled{};
 float aimSpeed = 35.0f;
 re4mc::FreeCameraFrame cameraFrame;
 std::array<unsigned, 5> keyCodes{'W', 'S', 'A', 'D', VK_SHIFT};
+// Gamepad: walk while aiming with an analog stick (the rest stays native).
+bool controllerEnabled = true;
+float controllerDeadZone = 0.25f;
+bool controllerInvertY{};
+bool controllerRightStick{};
 
 bool executableAddress(const void* address) {
     MEMORY_BASIC_INFORMATION info{};
@@ -69,7 +74,8 @@ re4mc::Context context(cPlayer* player) {
     c.enabled = enabled && installed;
     c.focused = hWindow && GetForegroundWindow() == hWindow;
     c.keyboardMouse = isKeyboardMouse();
-    c.blocked = bCfgMenuOpen || bConsoleOpen || bImGuiUIFocus || OptionOpenFlag();
+    c.controller = controllerEnabled && !c.keyboardMouse && isController();
+    c.blocked =bCfgMenuOpen || bConsoleOpen || bImGuiUIFocus || OptionOpenFlag();
     auto g = GlobalPtr();
     if (!g || !player) { c.mainLoop = false; return c; }
     if (player != PlayerPtr()) { c.playerObject = false; return c; }
@@ -102,6 +108,16 @@ re4mc::Keys readKeys(re4mc::Context& c) {
     return {pInput->is_key_down(keyCodes[0]), pInput->is_key_down(keyCodes[1]),
             pInput->is_key_down(keyCodes[2]), pInput->is_key_down(keyCodes[3]),
             pInput->is_key_down(keyCodes[4])};
+}
+
+// Keyboard: WASD. Gamepad: the analog stick chosen in the INI (left by default).
+re4mc::Direction readDirection(const re4mc::Context& c, const re4mc::Keys& keys) {
+    if (c.keyboardMouse) return re4mc::direction(keys);
+    if (!c.controller) return {};
+    const float* x = controllerRightStick ? fAnalogRX : fAnalogLX;
+    const float* y = controllerRightStick ? fAnalogRY : fAnalogLY;
+    if (!x || !y) return {};
+    return re4mc::analogDirection(*x, controllerInvertY ? -*y : *y, controllerDeadZone);
 }
 
 void setRoutine(cPlayer* player, unsigned routine) {
@@ -156,7 +172,8 @@ template<unsigned entry> void __cdecl dispatch(cPlayer* player) {
     re4mc::diagnostics::mark(1, entry); // Entering context/input collection.
     auto c = context(player);
     const auto keys = readKeys(c); // Release the input lock before calling native code.
-    const auto decision = re4mc::decide(c, keys);
+    const auto moveDirection = readDirection(c, keys);
+    const auto decision = re4mc::decide(c, moveDirection, keys.run);
     static std::array<unsigned, 5> observations{};
     const auto action = unsigned(decision.action);
     const bool report = observations[action]++ < 2;
@@ -179,7 +196,7 @@ template<unsigned entry> void __cdecl dispatch(cPlayer* player) {
         invoke(entry);
         // A shot/interaction can exit the weapon state. Never drag another action.
         const auto after = context(player);
-        if (re4mc::decide(after, keys).action != re4mc::Action::AimMove) return;
+        if (re4mc::decide(after, moveDirection, keys.run).action != re4mc::Action::AimMove) return;
         const auto& camera = GlobalPtr()->Camera_74;
         const auto step = re4mc::aimDisplacement(decision.direction,
             {-camera.Look_D0.x, -camera.Look_D0.z},
@@ -234,6 +251,12 @@ void readConfig() {
         const auto key = GetPrivateProfileIntW(L"KEYS", names[i], keyCodes[i], path.c_str());
         if (key > 0 && key < 256) keyCodes[i] = key;
     }
+    controllerEnabled = GetPrivateProfileIntW(L"CONTROLLER", L"Enabled", 1, path.c_str()) != 0;
+    controllerInvertY = GetPrivateProfileIntW(L"CONTROLLER", L"InvertY", 0, path.c_str()) != 0;
+    controllerRightStick = GetPrivateProfileIntW(L"CONTROLLER", L"MoveStick", 0, path.c_str()) == 1;
+    GetPrivateProfileStringW(L"CONTROLLER", L"DeadZone", L"0.25", number, 80, path.c_str());
+    const auto dead = std::wcstof(number, &end);
+    if (end != number && *end == 0 && std::isfinite(dead)) controllerDeadZone = std::clamp(dead, 0.0f, 0.9f);
 }
 } // namespace
 
@@ -331,5 +354,6 @@ void re4t::init::ModernControls() {
     re4t::cfg->bResetCameraAfterUsingWeapons = false;
     re4t::cfg->bResetCameraAfterUsingKnife = false;
     re4t::cfg->bUseSprintToggle = false;
-    spd::log()->info("ModernControls -> EXPERIMENTAL 0.1.4, KB/M enabled; Leon/Ashley/Ada/HUNK/Krauser/Wesker; independent camera reference; diagnostics={}; native Walk/Run prologues preserved; game validation pending", diagnosticEnabled);
+    spd::log()->info("ModernControls -> EXPERIMENTAL 0.1.4 + CONTROLE, KB/M enabled; gamepad aim-walk={} (stick={}, deadzone={}, invertY={}); Leon/Ashley/Ada/HUNK/Krauser/Wesker; independent camera reference; diagnostics={}; native Walk/Run prologues preserved; game validation pending",
+        controllerEnabled, controllerRightStick ? "right" : "left", controllerDeadZone, controllerInvertY, diagnosticEnabled);
 }
